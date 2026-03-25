@@ -1,0 +1,362 @@
+*&---------------------------------------------------------------------*
+*&  Include  ZBW_TOOL_DECL
+*&  ZBW_SMART_MIGRATION_TOOL — Production Declarations
+*&  Version: 3.0 (Background/Multi-Provider/Memory-Optimised)
+*&  Old-kernel safe: BW 7.50 SP19 — no inline DATA(), no VALUE()/NEW
+*&---------------------------------------------------------------------*
+
+*======================================================================
+*  TYPES — Core Flow & Lineage
+*======================================================================
+TYPES: BEGIN OF TY_FLOW,
+         CONTEXT_PROVIDER TYPE C LENGTH 30,
+         TARGET           TYPE C LENGTH 30,
+         TARGET_TYPE      TYPE STRING,
+         T_TABLE_NAME     TYPE STRING,
+         SOURCE           TYPE C LENGTH 50,
+         SOURCE_TYPE      TYPE STRING,
+         SOURCE_LOGSYS    TYPE RSSLOGSYS,
+         S_TABLE_NAME     TYPE STRING,
+         TRANID           TYPE RSTRAN-TRANID,
+         PROGRAM          TYPE PROGNAME,
+       END OF TY_FLOW.
+TYPES TY_FLOW_TAB TYPE STANDARD TABLE OF TY_FLOW WITH EMPTY KEY.
+
+TYPES: BEGIN OF TY_LOAD,
+         PROVIDER        TYPE C LENGTH 30,
+         PROVIDER_TYPE   TYPE STRING,
+         SOURCE_LOGSYS   TYPE RSSLOGSYS,
+         PHYSICAL_TABLE  TYPE DD02L-TABNAME,
+         LAST_TS_UTC     TYPE RSTIMESTMP,
+         LAST_DATE_LOCAL TYPE DATS,
+         LAST_TIME_LOCAL TYPE TIMS,
+         AGE_DAYS        TYPE I,
+         AGE_BUCKET      TYPE C LENGTH 6,
+         NOTE            TYPE STRING,
+       END OF TY_LOAD.
+TYPES TY_LOAD_TAB TYPE STANDARD TABLE OF TY_LOAD WITH EMPTY KEY.
+
+TYPES: BEGIN OF TY_INACTIVE,
+         KIND   TYPE STRING,
+         NAME   TYPE C LENGTH 40,
+         DETAIL TYPE STRING,
+       END OF TY_INACTIVE.
+TYPES TY_INACTIVE_TAB TYPE STANDARD TABLE OF TY_INACTIVE WITH EMPTY KEY.
+
+*======================================================================
+*  TYPES — Transformation Mapping
+*======================================================================
+TYPES: BEGIN OF TY_FIELD,
+         TRANID    TYPE RSTRAN-TRANID,
+         RULEID    TYPE INT2,
+         PARAMTYPE TYPE NUMC1,
+         FIELDNM   TYPE C LENGTH 30,
+       END OF TY_FIELD.
+
+TYPES: BEGIN OF TY_RULE_HDR,
+         TRANID   TYPE RSTRAN-TRANID,
+         RULEID   TYPE INT2,
+         RULETYPE TYPE C LENGTH 20,
+       END OF TY_RULE_HDR.
+
+TYPES: BEGIN OF TY_MAP_ENRICHED,
+         SOURCE_FIELD  TYPE STRING,
+         KEYFLAG_S     TYPE C,
+         TARGET_FIELD  TYPE STRING,
+         KEYFLAG_T     TYPE C,
+         RULE_TYPE     TYPE STRING,
+         CONSTANT_VAL  TYPE STRING,
+         FORMULA_TEXT  TYPE STRING,
+         MASTER_SOURCE TYPE STRING,
+         ROUTINE_FLAG  TYPE STRING,
+       END OF TY_MAP_ENRICHED.
+TYPES TY_MAP_TAB TYPE STANDARD TABLE OF TY_MAP_ENRICHED WITH EMPTY KEY.
+
+TYPES: BEGIN OF TY_ROUTINE,
+         TRANID       TYPE RSTRAN-TRANID,
+         ROUTINE_TYPE TYPE STRING,
+         ROUTINE_ID   TYPE STRING,
+         CODE         TYPE STANDARD TABLE OF STRING WITH EMPTY KEY,
+       END OF TY_ROUTINE.
+TYPES TY_ROUTINE_TAB TYPE STANDARD TABLE OF TY_ROUTINE WITH EMPTY KEY.
+
+TYPES TY_SEEN_TAB TYPE SORTED TABLE OF PROGNAME WITH UNIQUE KEY TABLE_LINE.
+
+TYPES: BEGIN OF TY_V2F,
+         VAR   TYPE STRING,
+         FIELD TYPE STRING,
+       END OF TY_V2F.
+
+TYPES: BEGIN OF TY_V2M,
+         VAR  TYPE STRING,
+         METH TYPE STRING,
+       END OF TY_V2M.
+
+TYPES: BEGIN OF TY_V2E,
+         VAR   TYPE STRING,
+         EXPR  TYPE STRING,
+         MDTAB TYPE STRING,
+       END OF TY_V2E.
+
+TYPES: BEGIN OF TY_DETAIL,
+         TARGET_FIELD  TYPE STRING,
+         SOURCE_FIELD  TYPE STRING,
+         CONSTANT_VAL  TYPE STRING,
+         FORMULA_TEXT  TYPE STRING,
+         MASTER_SOURCE TYPE STRING,
+         ROUTINE_FLAG  TYPE C,
+       END OF TY_DETAIL.
+TYPES TY_DETAIL_TAB TYPE STANDARD TABLE OF TY_DETAIL WITH EMPTY KEY.
+
+TYPES: BEGIN OF TY_DEP,
+         TRANID    TYPE RSTRAN-TRANID,
+         CONTAINER TYPE STRING,
+         DEP_KIND  TYPE STRING,
+         DEP_NAME  TYPE STRING,
+         WHERE_TXT TYPE STRING,
+         LINE_NO   TYPE C LENGTH 4,
+         NOTE      TYPE STRING,
+       END OF TY_DEP.
+TYPES TY_DEP_TAB TYPE STANDARD TABLE OF TY_DEP WITH EMPTY KEY.
+
+TYPES TY_STRINGTAB  TYPE STANDARD TABLE OF STRING     WITH DEFAULT KEY.
+TYPES TY_FM_TAB     TYPE STANDARD TABLE OF RS38L_FNAM WITH DEFAULT KEY.
+TYPES TY_NAME_TAB   TYPE SORTED TABLE OF CHAR30       WITH UNIQUE KEY TABLE_LINE.
+TYPES TY_IOBJ_TAB   TYPE SORTED TABLE OF RSIOBJNM     WITH UNIQUE KEY TABLE_LINE.
+
+*--- DSO/DS/Cube helpers (EXPORT_DDL_FILES)
+TYPES TY_DSO_TAB  TYPE SORTED TABLE OF RSDODSO-ODSOBJECT   WITH UNIQUE KEY TABLE_LINE.
+TYPES TY_DS_TAB   TYPE SORTED TABLE OF RSDS-DATASOURCE     WITH UNIQUE KEY TABLE_LINE.
+TYPES TY_CUBE_TAB TYPE SORTED TABLE OF RSDCUBE-INFOCUBE    WITH UNIQUE KEY TABLE_LINE.
+TYPES: BEGIN OF TY_DS_LS,
+         DS     TYPE RSDS-DATASOURCE,
+         LOGSYS TYPE RSSLOGSYS,
+       END OF TY_DS_LS.
+TYPES TY_DS_LS_TAB TYPE SORTED TABLE OF TY_DS_LS WITH UNIQUE KEY DS LOGSYS.
+
+*======================================================================
+*  TYPES — FM Extractor
+*======================================================================
+TYPES: BEGIN OF TY_EDGE,
+         PARENT TYPE RS38L_FNAM,
+         CHILD  TYPE RS38L_FNAM,
+         KIND   TYPE C LENGTH 10,
+       END OF TY_EDGE.
+TYPES TY_EDGE_TAB TYPE STANDARD TABLE OF TY_EDGE WITH DEFAULT KEY.
+
+TYPES: BEGIN OF TY_PERF_REF,
+         FORM TYPE STRING,
+         PROG TYPE PROGNAME,
+       END OF TY_PERF_REF.
+TYPES TY_PERF_TAB TYPE STANDARD TABLE OF TY_PERF_REF WITH DEFAULT KEY.
+
+TYPES: BEGIN OF TY_FORM_CACHE,
+         PROG    TYPE PROGNAME,
+         FORM    TYPE STRING,
+         INCLUDE TYPE PROGNAME,
+       END OF TY_FORM_CACHE.
+TYPES TY_FORM_CACHE_TAB TYPE STANDARD TABLE OF TY_FORM_CACHE WITH DEFAULT KEY.
+
+TYPES: BEGIN OF TY_PAIR,
+         PARENT TYPE RS38L_FNAM,
+         CHILD  TYPE RS38L_FNAM,
+       END OF TY_PAIR.
+TYPES TY_PAIR_TAB TYPE STANDARD TABLE OF TY_PAIR WITH DEFAULT KEY.
+
+*======================================================================
+*  TYPES — Process Chain
+*======================================================================
+TYPES: BEGIN OF TY_PC_STEP,
+         CHAIN    TYPE RSPC_CHAIN,
+         STEPTYPE TYPE RSPC_TYPE,
+         STEPNAME TYPE RSPC_VARIANT,
+         STEPPOS  TYPE I,
+       END OF TY_PC_STEP.
+TYPES TY_PC_STEP_TAB TYPE STANDARD TABLE OF TY_PC_STEP WITH EMPTY KEY.
+
+TYPES: BEGIN OF TY_PC_HDR,
+         CHAIN   TYPE RSPC_CHAIN,
+         TXTLG   TYPE C LENGTH 40,
+         PACKAGE TYPE DEVCLASS,
+       END OF TY_PC_HDR.
+TYPES TY_PC_HDR_TAB TYPE STANDARD TABLE OF TY_PC_HDR WITH EMPTY KEY.
+
+*======================================================================
+*  TYPES — Reconciliation
+*======================================================================
+TYPES: BEGIN OF TY_RECON,
+         TABLE_NAME  TYPE DD02L-TABNAME,
+         SRC_COUNT   TYPE I,
+         TGT_COUNT   TYPE I,
+         DIFF        TYPE I,
+         STATUS      TYPE C LENGTH 10,
+         WHERE_USED  TYPE STRING,
+       END OF TY_RECON.
+TYPES TY_RECON_TAB TYPE STANDARD TABLE OF TY_RECON WITH EMPTY KEY.
+
+*======================================================================
+*  TYPES — Checkpoint (progress tracking across providers)
+*======================================================================
+TYPES: BEGIN OF TY_CHECKPOINT,
+         PROVIDER   TYPE C LENGTH 30,
+         STATUS     TYPE C LENGTH 10,    " DONE / SKIP / ERROR
+         TIMESTAMP  TYPE C LENGTH 14,    " SY-DATUM + SY-UZEIT
+         MESSAGE    TYPE STRING,
+       END OF TY_CHECKPOINT.
+TYPES TY_CHECKPOINT_TAB TYPE STANDARD TABLE OF TY_CHECKPOINT WITH EMPTY KEY.
+
+*======================================================================
+*  DATA — Execution Mode & Output Routing
+*======================================================================
+" GV_BATCH: set at runtime from SY-BATCH — drives frontend vs appserver
+DATA: GV_BATCH       TYPE C,        " 'X' = batch/appserver, ' ' = dialog
+      GV_AL11_PATH   TYPE STRING,   " Appserver output root (AL11 path)
+      GV_OUT_SEP     TYPE C LENGTH 1. " OS separator ('/' or '\')
+
+*======================================================================
+*  DATA — Core Lineage Engine (Tab 1)
+*======================================================================
+DATA: GT_FLOW     TYPE STANDARD TABLE OF TY_FLOW,
+      GT_TRAN     TYPE STANDARD TABLE OF RSTRAN,
+      GT_SEEN     TYPE SORTED TABLE OF CHAR30 WITH UNIQUE KEY TABLE_LINE,
+      GV_CTX      TYPE C LENGTH 30,
+      GV_MSG      TYPE STRING,
+      GV_OUTDIR   TYPE STRING.
+
+DATA: GT_DETAILS  TYPE TY_DETAIL_TAB.
+DATA: GT_LOAD     TYPE TY_LOAD_TAB.
+DATA: GT_INACTIVE TYPE TY_INACTIVE_TAB.
+
+DATA: GT_DEP_LOG  TYPE TY_DEP_TAB,
+      GT_DDL_TABS TYPE SORTED TABLE OF DD02L-TABNAME WITH UNIQUE KEY TABLE_LINE,
+      GT_FM_QUEUE TYPE SORTED TABLE OF RS38L_FNAM    WITH UNIQUE KEY TABLE_LINE.
+
+*--- Folder paths (STRING for unlimited length)
+DATA: GV_ROOT_DIR  TYPE STRING,
+      GV_FLOW_DIR  TYPE STRING,
+      GV_DDL_DIR   TYPE STRING,
+      GV_TRANS_DIR TYPE STRING,
+      GV_OVW_DIR   TYPE STRING,
+      GV_MD_DIR    TYPE STRING,
+      GV_FM_DIR    TYPE STRING,
+      GV_PC_DIR    TYPE STRING,
+      GV_RC_DIR    TYPE STRING.
+
+*--- Misc
+DATA: GV_TABNAME  TYPE DD02L-TABNAME,
+      GT_SQL      TYPE STANDARD TABLE OF STRING WITH EMPTY KEY,
+      GV_CUBE     TYPE RSDCUBE-INFOCUBE,
+      GV_DSNAME   TYPE RSDS-DATASOURCE,
+      GT_TABNAMES TYPE STANDARD TABLE OF DD02L-TABNAME WITH DEFAULT KEY.
+
+DATA: GV_SCAN_TRANID    TYPE RSTRAN-TRANID,
+      GV_SCAN_CONTAINER TYPE STRING,
+      GT_SCAN_SRC       TYPE STANDARD TABLE OF STRING WITH EMPTY KEY.
+
+DATA GT_STOPWORDS TYPE STANDARD TABLE OF STRING WITH EMPTY KEY.
+DATA GT_MD_IOBJ   TYPE TY_IOBJ_TAB.
+
+DATA GT_FLAG_DSO  TYPE HASHED TABLE OF STRING WITH UNIQUE KEY TABLE_LINE.
+DATA GT_FLAG_CUBE TYPE HASHED TABLE OF STRING WITH UNIQUE KEY TABLE_LINE.
+DATA GT_SUMMARY   TYPE STANDARD TABLE OF STRING WITH EMPTY KEY.
+
+DATA: GV_CNT_TRAN        TYPE I,
+      GV_CNT_TRAN_W_ROUT TYPE I,
+      GV_CNT_BRONZE      TYPE I,
+      GV_CNT_SILVER      TYPE I,
+      GV_CNT_GOLD        TYPE I.
+
+*======================================================================
+*  DATA — FM Extractor (Tab 2)
+*======================================================================
+DATA: GV_SEP               TYPE C LENGTH 1,
+      GV_BASE_FOLDER       TYPE STRING,
+      GV_RC                TYPE I,
+      GV_MAXFM             TYPE I,
+      GV_FM_COUNT          TYPE I,
+      GV_LIMIT_REACHED     TYPE C,
+      GV_STD_DEPTH         TYPE I,
+      GV_STD_DEPTH_MAX     TYPE I,
+      GV_STD_SKIPPED_COUNT TYPE STRING.
+
+DATA: GT_TREE       TYPE TY_STRINGTAB,
+      GT_EDGES_TXT  TYPE TY_STRINGTAB,
+      GT_VISITED_FM TYPE TY_FM_TAB,
+      GT_MISSING    TYPE TY_STRINGTAB,
+      GT_DONE_PERF  TYPE TY_PERF_TAB,
+      GT_FORM_CACHE TYPE TY_FORM_CACHE_TAB.
+
+*======================================================================
+*  DATA — Process Chain (Tab 3)
+*======================================================================
+DATA: GT_PC_HDR   TYPE TY_PC_HDR_TAB,
+      GT_PC_STEPS TYPE TY_PC_STEP_TAB.
+DATA: GT_PC_SEEN  TYPE SORTED TABLE OF RSPC_CHAIN WITH UNIQUE KEY TABLE_LINE.
+* GT_PC_ALL_STEPS: flat table across all chains for Excel export
+TYPES: BEGIN OF TY_PC_XLS_ROW,
+         CHAIN    TYPE RSPC_CHAIN,
+         CHAIN_TXT TYPE C LENGTH 40,
+         STEPPOS  TYPE I,
+         STEPTYPE TYPE RSPC_TYPE,
+         STEPNAME TYPE RSPC_VARIANT,
+         SRC      TYPE C LENGTH 30,
+         TGT      TYPE C LENGTH 30,
+         UPDMODE  TYPE C LENGTH 2,
+         LOGSYS   TYPE C LENGTH 10,
+         ABAP_PRG TYPE C LENGTH 30,
+         LEVEL    TYPE I,
+       END OF TY_PC_XLS_ROW.
+TYPES TY_PC_XLS_TAB TYPE STANDARD TABLE OF TY_PC_XLS_ROW WITH DEFAULT KEY.
+DATA: GT_PC_XLS TYPE TY_PC_XLS_TAB.
+
+*======================================================================
+*  DATA — Reconciliation (Tab 4)
+*======================================================================
+DATA: GT_RECON    TYPE TY_RECON_TAB.
+
+*======================================================================
+*  DATA — Checkpoint / Progress
+*======================================================================
+DATA: GT_CHECKPOINT TYPE TY_CHECKPOINT_TAB,
+      GV_CHKPT_FILE TYPE STRING.   " Full path to checkpoint file
+
+*======================================================================
+*  DATA — Helper vars
+*======================================================================
+DATA: LS_F4_RET    TYPE DDSHRETVAL,
+      GT_IA_PROV   TYPE TY_NAME_TAB,
+      GV_IA_PROV   TYPE C LENGTH 30,
+      GV_FM_ROOT   TYPE STRING,
+      GV_SKIP_MSG  TYPE STRING.
+
+*--- Mermaid loop vars
+DATA: GV_MMD_SRC  TYPE STRING,
+      GV_MMD_TGT  TYPE STRING,
+      GV_MMD_LINE TYPE STRING,
+      GV_MMD_LBL  TYPE STRING.
+
+*--- Job scheduling
+DATA: GV_JOBNAME  TYPE BTCJOB,
+      GV_JOBCOUNT TYPE BTCJOBCNT.
+
+*======================================================================
+*  CONSTANTS — JSON characters
+*======================================================================
+CONSTANTS: GC_LBRACE TYPE C VALUE '{',
+           GC_RBRACE TYPE C VALUE '}',
+           GC_LBRACK TYPE C VALUE '[',
+           GC_RBRACK TYPE C VALUE ']',
+           GC_QUOTE  TYPE C VALUE '"',
+           GC_COLON  TYPE C VALUE ':',
+           GC_COMMA  TYPE C VALUE ','.
+
+*======================================================================
+*  CONSTANTS — Tool metadata
+*======================================================================
+CONSTANTS: GC_TOOL_VERSION TYPE STRING VALUE '3.0',
+           GC_TOOL_NAME    TYPE STRING VALUE 'ZBW_SMART_MIGRATION_TOOL',
+           GC_FM_CACHE_CAP TYPE I      VALUE 500.   " Max FM cache entries
+
+*======================================================================
+*  END OF ZBW_TOOL_DECL
+*======================================================================

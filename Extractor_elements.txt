@@ -1,0 +1,27 @@
+R01	Transactional Data Extract	26	52
+R02	Master Data Extract	19	22
+R03	Local System	12	22
+R04	Application Server Path	23	46
+T01	Input Provider (MP/CUBE/DSO/IS)	31	66
+T02	Select Artefacts to Download	28	56
+T04	Enter Data Provider and File Path	33	66
+   	                                    
+
+P_APPDIR	Application Directory
+P_BEX	Bex Query Reports
+P_DDL	DDL for Bronze Silver and Gold
+P_DUDS	Direct Update DSO
+P_FEDIR	Local System Path
+P_FLOW	Flow Details
+P_IS	Info Source
+P_JSON	Download JSON File
+P_MAP	Download Transformation Mappin
+P_MP	Mukti Provider
+P_ROUT	Download Routine
+P_TZONE	Time Zone for Load Information
+RB_APP	?...
+RB_FE	?...
+RB_MD	?...
+RB_PROV	?...
+SO_MD	Master Data Object
+SO_PROV	Transactional Data provider                                                                                               

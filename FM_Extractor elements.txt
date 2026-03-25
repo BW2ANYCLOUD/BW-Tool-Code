@@ -1,0 +1,6 @@
+P_FM	Function Module Name
+P_MAXFM	Maximum no of FM's to analyse
+P_PATH	System path to download
+P_STDDEP	Max no of Nested FM's to analy
+________	______________________________
+________	______________________________

@@ -1,0 +1,1500 @@
+REPORT ZBW_FM_EXTRACTION_MASTER.
+
+*---------------------------------------------------------------------*
+* Parameters
+*---------------------------------------------------------------------*
+PARAMETERS:
+  P_FM    TYPE RS38L_FNAM OBLIGATORY,
+  P_PATH  TYPE STRING     OBLIGATORY,
+  P_MAXFM TYPE I          DEFAULT 30.  " Max distinct FMs to process
+PARAMETERS:  P_STDDEP TYPE I DEFAULT 5   " Max standard FM depth
+    LOWER CASE.
+
+*---------------------------------------------------------------------*
+* Types
+*---------------------------------------------------------------------*
+TYPES: TY_STRINGTAB TYPE STANDARD TABLE OF STRING     WITH DEFAULT KEY.
+TYPES: TY_FM_TAB    TYPE STANDARD TABLE OF RS38L_FNAM WITH DEFAULT KEY.
+
+TYPES: BEGIN OF TY_EDGE,
+         PARENT TYPE RS38L_FNAM,
+         CHILD  TYPE RS38L_FNAM,
+         KIND   TYPE C LENGTH 10,
+       END OF TY_EDGE.
+TYPES: TY_EDGE_TAB TYPE STANDARD TABLE OF TY_EDGE WITH DEFAULT KEY.
+
+*--- PERFORM references (FORM + optional program)
+TYPES: BEGIN OF TY_PERF_REF,
+         FORM TYPE STRING,
+         PROG TYPE PROGNAME,
+       END OF TY_PERF_REF.
+TYPES: TY_PERF_TAB TYPE STANDARD TABLE OF TY_PERF_REF WITH DEFAULT KEY.
+
+* Cache: (prog, form) -> include
+TYPES: BEGIN OF TY_FORM_CACHE,
+         PROG    TYPE PROGNAME,
+         FORM    TYPE STRING,
+         INCLUDE TYPE PROGNAME,
+       END OF TY_FORM_CACHE.
+TYPES: TY_FORM_CACHE_TAB TYPE STANDARD TABLE OF TY_FORM_CACHE WITH DEFAULT KEY.
+
+*---------------------------------------------------------------------*
+* Data
+*---------------------------------------------------------------------*
+DATA: GV_SEP           TYPE C LENGTH 1,
+      GV_BASE_FOLDER   TYPE CHAR200,
+      GV_RC            TYPE I,
+      GV_MAXFM         TYPE I,
+      GV_FM_COUNT      TYPE I VALUE 0,
+      GV_LIMIT_REACHED TYPE C.
+
+"Standard FM recursion control
+DATA GV_STD_DEPTH TYPE I VALUE 0.
+DATA GV_STD_DEPTH_MAX TYPE I.
+DATA GV_STD_SKIPPED_COUNT TYPE STRING VALUE 0.
+
+DATA: GT_TREE       TYPE TY_STRINGTAB,
+      GT_EDGES_TXT  TYPE TY_STRINGTAB,
+      GT_VISITED_FM TYPE TY_FM_TAB,
+      GT_MISSING    TYPE TY_STRINGTAB.
+
+* Visited performs per FM run (prog+form)
+DATA: GT_DONE_PERF   TYPE TY_PERF_TAB.
+
+* Include cache
+DATA: GT_FORM_CACHE  TYPE TY_FORM_CACHE_TAB.
+
+*---------------------------------------------------------------------*
+* START-OF-SELECTION
+*---------------------------------------------------------------------*
+START-OF-SELECTION.
+  IF SY-BATCH = 'X'.
+    MESSAGE 'Run in dialog only (frontend download).' TYPE 'E'.
+  ENDIF.
+
+  "Initialize limit (fallback to 30 if input is invalid)
+  IF P_MAXFM IS INITIAL OR P_MAXFM < 1.
+    GV_MAXFM = 30.
+  ELSE.
+    GV_MAXFM = P_MAXFM.
+  ENDIF.
+  "Initialize standard FM depth limit
+  IF P_STDDEP IS INITIAL OR P_STDDEP < 1.
+    GV_STD_DEPTH_MAX = 5.
+  ELSE.
+    GV_STD_DEPTH_MAX = P_STDDEP.
+  ENDIF.
+
+  GV_STD_DEPTH = 0.
+  GV_STD_SKIPPED_COUNT = 0.
+
+  CLEAR GV_FM_COUNT.
+  CLEAR GV_LIMIT_REACHED.
+
+  PERFORM GET_FILE_SEPARATOR CHANGING GV_SEP.
+  PERFORM NORMALIZE_PATH USING P_PATH GV_SEP CHANGING GV_BASE_FOLDER.
+  CONCATENATE GV_BASE_FOLDER GV_SEP P_FM INTO GV_BASE_FOLDER.
+  PERFORM DIR_CREATE_SAFE USING GV_BASE_FOLDER.
+
+  PERFORM PROCESS_FM USING P_FM 0.
+
+  PERFORM DOWNLOAD_FILE_TO_FOLDER USING GV_BASE_FOLDER 'CALL_TREE'  GT_TREE.
+  PERFORM DOWNLOAD_FILE_TO_FOLDER USING GV_BASE_FOLDER 'LINEAGE'    GT_EDGES_TXT.
+
+  IF GT_MISSING IS NOT INITIAL.
+    PERFORM DOWNLOAD_FILE_TO_FOLDER USING GV_BASE_FOLDER 'MISSING_OBJECTS' GT_MISSING.
+  ENDIF.
+
+*  DATA LT_JSON TYPE TY_STRINGTAB.
+*
+*  REFRESH LT_JSON.
+*  PERFORM BUILD_JSON_TREE USING P_FM CHANGING LT_JSON.
+**
+**  REFRESH LT_JSON.
+**  PERFORM BUILD_JSON_TREE USING P_FM CHANGING LT_JSON.
+*
+*  PERFORM DOWNLOAD_FILE_JSON_TO_FOLDER USING GV_BASE_FOLDER P_FM LT_JSON.
+*
+  DATA LV_MSG TYPE STRING.
+
+  IF GV_STD_SKIPPED_COUNT > 0.
+    CLEAR LV_MSG.
+    CONCATENATE 'Standard FM depth limit encountered.'
+                'Skipped FM count:' GV_STD_SKIPPED_COUNT
+        INTO LV_MSG SEPARATED BY SPACE.
+    APPEND LV_MSG TO GT_MISSING.   "or gt_tree
+  ENDIF.
+  MESSAGE 'Extraction completed successfully' TYPE 'I'.
+*---------------------------------------------------------------------*
+* FORM GET_FILE_SEPARATOR  (frontend separator - classic)
+*---------------------------------------------------------------------*
+FORM GET_FILE_SEPARATOR CHANGING P_SEP TYPE C.
+  DATA LV_SEP TYPE C.
+  P_SEP = '\'.
+  CLEAR LV_SEP.
+  CALL METHOD CL_GUI_FRONTEND_SERVICES=>GET_FILE_SEPARATOR
+    CHANGING
+      FILE_SEPARATOR       = LV_SEP
+    EXCEPTIONS
+      NOT_SUPPORTED_BY_GUI = 1
+      ERROR_NO_GUI         = 2
+      CNTL_ERROR           = 3
+      OTHERS               = 4.
+  IF SY-SUBRC = 0 AND LV_SEP IS NOT INITIAL.
+    P_SEP = LV_SEP+0(1).
+  ENDIF.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM NORMALIZE_PATH  (trim trailing separators; legacy safe)
+*---------------------------------------------------------------------*
+FORM NORMALIZE_PATH USING    P_IN  TYPE STRING
+                             P_SEP TYPE C
+                     CHANGING P_OUT TYPE CHAR200.
+  DATA: LV_LEN TYPE I,
+        LV_OFF TYPE I,
+        LV_NEW TYPE I.
+  P_OUT = P_IN.
+  IF P_OUT IS INITIAL.
+    MESSAGE 'P_PATH is initial.' TYPE 'E'.
+  ENDIF.
+
+  WHILE P_OUT IS NOT INITIAL.
+    DESCRIBE FIELD P_OUT LENGTH LV_LEN IN CHARACTER MODE.
+    IF LV_LEN <= 0.
+      EXIT.
+    ENDIF.
+    LV_OFF = LV_LEN - 1.
+    IF P_OUT+LV_OFF(1) <> P_SEP.
+      EXIT.
+    ENDIF.
+    LV_NEW = LV_LEN - 1.
+    P_OUT  = P_OUT(LV_NEW).
+  ENDWHILE.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM DIR_CREATE_SAFE
+*---------------------------------------------------------------------*
+FORM DIR_CREATE_SAFE USING P_DIR TYPE CHAR200.
+  DATA: LV_DIR       TYPE STRING,
+        LV_MSG       TYPE CHAR200,
+        LV_SUBRC_TXT TYPE CHAR20.
+  LV_DIR = P_DIR.
+  CALL METHOD CL_GUI_FRONTEND_SERVICES=>DIRECTORY_CREATE
+    EXPORTING
+      DIRECTORY                = LV_DIR
+    CHANGING
+      RC                       = GV_RC
+    EXCEPTIONS
+      DIRECTORY_CREATE_FAILED  = 1
+      CNTL_ERROR               = 2
+      ERROR_NO_GUI             = 3
+      DIRECTORY_ACCESS_DENIED  = 4
+      DIRECTORY_ALREADY_EXISTS = 5
+      PATH_NOT_FOUND           = 6
+      UNKNOWN_ERROR            = 7
+      NOT_SUPPORTED_BY_GUI     = 8
+      WRONG_PARAMETER          = 9
+      OTHERS                   = 10.
+  IF SY-SUBRC <> 0 AND
+     SY-SUBRC <> 5.
+    CLEAR: LV_MSG, LV_SUBRC_TXT.
+    WRITE SY-SUBRC TO LV_SUBRC_TXT.
+    CONCATENATE 'Directory create failed (subrc=' LV_SUBRC_TXT '):' P_DIR
+           INTO LV_MSG SEPARATED BY SPACE.
+    MESSAGE LV_MSG TYPE 'E'.
+  ENDIF.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM GUI_DOWNLOAD_SAFE
+*---------------------------------------------------------------------*
+FORM GUI_DOWNLOAD_SAFE USING P_FILE TYPE STRING
+                            PT_TAB  TYPE TY_STRINGTAB.
+  DATA: LV_MSG       TYPE CHAR200,
+        LV_SUBRC_TXT TYPE CHAR20.
+  CALL METHOD CL_GUI_FRONTEND_SERVICES=>GUI_DOWNLOAD
+    EXPORTING
+      FILENAME                = P_FILE
+      FILETYPE                = 'ASC'
+    CHANGING
+      DATA_TAB                = PT_TAB
+    EXCEPTIONS
+      FILE_WRITE_ERROR        = 1
+      NO_BATCH                = 2
+      GUI_REFUSE_FILETRANSFER = 3
+      INVALID_TYPE            = 4
+      NO_AUTHORITY            = 5
+      UNKNOWN_ERROR           = 6
+      OTHERS                  = 22.
+  IF SY-SUBRC <> 0.
+    CLEAR: LV_MSG, LV_SUBRC_TXT.
+    WRITE SY-SUBRC TO LV_SUBRC_TXT.
+    CONCATENATE 'Download failed (subrc=' LV_SUBRC_TXT '):' P_FILE
+           INTO LV_MSG SEPARATED BY SPACE.
+    MESSAGE LV_MSG TYPE 'E'.
+  ENDIF.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM DOWNLOAD_FILE_TO_FOLDER
+*---------------------------------------------------------------------*
+FORM DOWNLOAD_FILE_TO_FOLDER USING P_FOLDER TYPE CHAR200
+                                   P_NAME   TYPE PROGNAME
+                                   PT_TAB   TYPE TY_STRINGTAB.
+  DATA LV_FILE TYPE STRING.
+  CONCATENATE P_FOLDER GV_SEP P_NAME '.txt' INTO LV_FILE.
+  PERFORM GUI_DOWNLOAD_SAFE USING LV_FILE PT_TAB.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM BUILD_INDENT
+*---------------------------------------------------------------------*
+FORM BUILD_INDENT USING P_LEVEL TYPE I
+                  CHANGING P_OUT TYPE STRING.
+  DATA LV_I TYPE I.
+  CLEAR P_OUT.
+  LV_I = 0.
+  WHILE LV_I < P_LEVEL.
+    CONCATENATE P_OUT ' ' INTO P_OUT.
+    LV_I = LV_I + 1.
+  ENDWHILE.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM GET_FM_INCLUDE (via ENLFDIR and RS_FUNCTION_POOL_CONTENTS)
+*---------------------------------------------------------------------*
+FORM GET_FM_INCLUDE USING    P_FM      TYPE RS38L_FNAM
+                    CHANGING C_AREA    TYPE RS38L_AREA
+                             C_MAIN    TYPE PROGNAME
+                             C_INCLUDE TYPE PROGNAME.
+  DATA: LT_FUNCTAB TYPE STANDARD TABLE OF RS38L_INCL WITH DEFAULT KEY,
+        LS_FUNCTAB TYPE RS38L_INCL.
+
+  CLEAR: C_AREA, C_MAIN, C_INCLUDE.
+
+  "Function module directory
+  SELECT SINGLE AREA
+    INTO C_AREA
+    FROM ENLFDIR
+    WHERE FUNCNAME = P_FM.
+
+  IF SY-SUBRC <> 0 OR C_AREA IS INITIAL.
+    SELECT SINGLE PNAME
+      INTO C_MAIN
+      FROM TFDIR
+      WHERE FUNCNAME = P_FM.
+    IF SY-SUBRC = 0 AND C_MAIN CP 'SAPL*'.
+      C_AREA = C_MAIN+4.
+    ENDIF.
+  ENDIF.
+
+  IF C_AREA IS INITIAL.
+    RETURN.
+  ENDIF.
+
+  CONCATENATE 'SAPL' C_AREA INTO C_MAIN.
+
+  REFRESH LT_FUNCTAB.
+  CALL FUNCTION 'RS_FUNCTION_POOL_CONTENTS'
+    EXPORTING
+      FUNCTION_POOL           = C_AREA
+    TABLES
+      FUNCTAB                 = LT_FUNCTAB
+    EXCEPTIONS
+      FUNCTION_POOL_NOT_FOUND = 1
+      OTHERS                  = 2.
+  IF SY-SUBRC <> 0.
+    RETURN.
+  ENDIF.
+
+  READ TABLE LT_FUNCTAB INTO LS_FUNCTAB WITH KEY FUNCNAME = P_FM.
+  IF SY-SUBRC = 0.
+    C_INCLUDE = LS_FUNCTAB-INCLUDE.
+  ENDIF.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM DUMP_FG_INCLUDES_FILTERED
+* Downloads ONLY:
+*   - TOP include (L<area>TOP)
+*   - UXX include (L<area>UXX)
+*   - Actual include where FM resides (P_MAIN)
+*   - Any include having at least one FORM ... ENDFORM
+*---------------------------------------------------------------------*
+FORM DUMP_FG_INCLUDES_FILTERED
+       USING    P_FOLDER TYPE CHAR200
+                P_MAIN   TYPE PROGNAME.
+
+  DATA: LT_INC     TYPE STANDARD TABLE OF PROGNAME,
+        LV_INC     TYPE PROGNAME,
+        LT_SRC     TYPE TY_STRINGTAB,
+        LV_LINE    TYPE STRING,
+        LV_UPPER   TYPE STRING,
+        LV_HASFORM TYPE ABAP_BOOL.
+
+  "Fetch all includes of this FG
+  REFRESH LT_INC.
+  CALL FUNCTION 'RS_GET_ALL_INCLUDES'
+    EXPORTING
+      PROGRAM    = P_MAIN
+    TABLES
+      INCLUDETAB = LT_INC.
+
+  LOOP AT LT_INC INTO LV_INC.
+
+    "Normalize uppercase version
+    LV_UPPER = LV_INC.
+    TRANSLATE LV_UPPER TO UPPER CASE.
+
+    "-----------------------------------------------------------------
+    " 1. Actual include of FM must always be written
+    "-----------------------------------------------------------------
+    IF LV_INC = P_MAIN.
+      READ REPORT LV_INC INTO LT_SRC.
+      IF SY-SUBRC = 0.
+        PERFORM DOWNLOAD_FILE_TO_FOLDER USING P_FOLDER LV_INC LT_SRC.
+      ENDIF.
+      CONTINUE.
+    ENDIF.
+
+    "-----------------------------------------------------------------
+    " 2. TOP include: L<AREA>TOP
+    "-----------------------------------------------------------------
+    IF LV_UPPER CP 'L*TOP'.
+      READ REPORT LV_INC INTO LT_SRC.
+      IF SY-SUBRC = 0.
+        PERFORM DOWNLOAD_FILE_TO_FOLDER USING P_FOLDER LV_INC LT_SRC.
+      ENDIF.
+      CONTINUE.
+    ENDIF.
+
+    "-----------------------------------------------------------------
+    " 3. UXX include: L<AREA>UXX
+    "-----------------------------------------------------------------
+    IF LV_UPPER CP 'L*UXX'.
+      READ REPORT LV_INC INTO LT_SRC.
+      IF SY-SUBRC = 0.
+        PERFORM DOWNLOAD_FILE_TO_FOLDER USING P_FOLDER LV_INC LT_SRC.
+      ENDIF.
+      CONTINUE.
+    ENDIF.
+
+    "-----------------------------------------------------------------
+    " 4. FORM include: must contain at least one FORM ... ENDFORM block
+    "-----------------------------------------------------------------
+    CLEAR LT_SRC.
+    READ REPORT LV_INC INTO LT_SRC.
+    IF SY-SUBRC <> 0.
+      CONTINUE.
+    ENDIF.
+
+    CLEAR LV_HASFORM.
+    LOOP AT LT_SRC INTO LV_LINE.
+      DATA(LV_TRIM) = LV_LINE.
+      SHIFT LV_TRIM LEFT DELETING LEADING SPACE.
+      TRANSLATE LV_TRIM TO UPPER CASE.
+
+      "Catch ANY FORM definition pattern:
+      "FORM name., FORM name ., FORM name USING, FORM name CHANGING, etc.
+      IF LV_TRIM CP 'FORM *'.
+        LV_HASFORM = ABAP_TRUE.
+        EXIT.
+      ENDIF.
+    ENDLOOP.
+
+    IF LV_HASFORM = ABAP_TRUE.
+      PERFORM DOWNLOAD_FILE_TO_FOLDER USING P_FOLDER LV_INC LT_SRC.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.
+*---------------------------------------------------------------------*
+* FORM ASSEMBLE_STATEMENTS  (assemble ABAP statements until '.')
+*---------------------------------------------------------------------*
+FORM ASSEMBLE_STATEMENTS USING    PT_SRC TYPE TY_STRINGTAB
+                         CHANGING CT_STM TYPE TY_STRINGTAB.
+  DATA: LV_LINE  TYPE STRING,
+        LV_WORK  TYPE STRING,
+        LV_STMT  TYPE STRING,
+        LV_DUMMY TYPE STRING.
+
+  REFRESH CT_STM.
+  CLEAR LV_STMT.
+
+  LOOP AT PT_SRC INTO LV_LINE.
+    LV_WORK = LV_LINE.
+    SHIFT LV_WORK LEFT DELETING LEADING SPACE.
+    IF LV_WORK IS INITIAL OR LV_WORK+0(1) = '*' OR LV_WORK+0(1) = '"'.
+      CONTINUE.
+    ENDIF.
+    SPLIT LV_WORK AT '"' INTO LV_WORK LV_DUMMY.
+    IF LV_WORK IS INITIAL.
+      CONTINUE.
+    ENDIF.
+
+    IF LV_STMT IS INITIAL.
+      LV_STMT = LV_WORK.
+    ELSE.
+      CONCATENATE LV_STMT LV_WORK INTO LV_STMT SEPARATED BY SPACE.
+    ENDIF.
+
+    IF LV_STMT CS '.'.
+      APPEND LV_STMT TO CT_STM.
+      CLEAR LV_STMT.
+    ENDIF.
+  ENDLOOP.
+
+  IF LV_STMT IS NOT INITIAL.
+    APPEND LV_STMT TO CT_STM.
+  ENDIF.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM GET_FORM_BLOCK (whitespace tolerant)
+*---------------------------------------------------------------------*
+FORM GET_FORM_BLOCK USING    P_INCLUDE TYPE PROGNAME
+                             P_FORM    TYPE STRING
+                    CHANGING CT_BLOCK  TYPE TY_STRINGTAB
+                             C_FOUND   TYPE C.
+  DATA: LT_SRC     TYPE TY_STRINGTAB,
+        LV_LINE    TYPE STRING,
+        LV_WORK    TYPE STRING,
+        LV_U       TYPE STRING,
+        LV_DUMMY   TYPE STRING,
+        LV_INBLOCK TYPE C,
+        LV_FORM_U  TYPE STRING,
+        LV_REGEX   TYPE STRING.
+
+  REFRESH CT_BLOCK.
+  C_FOUND    = SPACE.
+  LV_INBLOCK = SPACE.
+
+  READ REPORT P_INCLUDE INTO LT_SRC.
+  IF SY-SUBRC <> 0.
+    RETURN.
+  ENDIF.
+
+  LV_FORM_U = P_FORM.
+  TRANSLATE LV_FORM_U TO UPPER CASE.
+  CONCATENATE '^\s*FORM\s+' LV_FORM_U '\b' INTO LV_REGEX.
+
+  LOOP AT LT_SRC INTO LV_LINE.
+    LV_WORK = LV_LINE.
+    SHIFT LV_WORK LEFT DELETING LEADING SPACE.
+    IF LV_WORK IS INITIAL OR LV_WORK+0(1) = '*' OR LV_WORK+0(1) = '"'.
+      CONTINUE.
+    ENDIF.
+    SPLIT LV_WORK AT '"' INTO LV_WORK LV_DUMMY.
+    IF LV_WORK IS INITIAL.
+      CONTINUE.
+    ENDIF.
+
+    LV_U = LV_WORK.
+    TRANSLATE LV_U TO UPPER CASE.
+
+    IF LV_INBLOCK = SPACE.
+      FIND REGEX LV_REGEX IN LV_U.
+      IF SY-SUBRC = 0.
+        LV_INBLOCK = 'X'.
+        C_FOUND    = 'X'.
+      ELSE.
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+
+    APPEND LV_LINE TO CT_BLOCK.
+
+    IF LV_U CS 'ENDFORM.' OR LV_U CS 'ENDFORM .'.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM IS_STANDARD_FM – classifies SAP standard FMs
+*---------------------------------------------------------------------*
+FORM IS_STANDARD_FM USING P_FM TYPE RS38L_FNAM
+                    CHANGING P_STD TYPE ABAP_BOOL.
+
+  DATA LV TYPE STRING.
+  LV = P_FM.
+  TRANSLATE LV TO UPPER CASE.
+
+  IF LV CP 'R*'
+  OR LV CP 'RS*'
+  OR LV CP 'RR*'
+  OR LV CP 'DD*'
+  OR LV CP 'ENQUEUE*'
+  OR LV CP 'DEQUEUE*'
+  OR LV CP 'TR*'
+  OR LV CP 'S*'
+  OR LV CP 'CL_*'
+  OR LV CP 'SAP*'.
+    P_STD = ABAP_TRUE.
+  ELSE.
+    P_STD = ABAP_FALSE.
+  ENDIF.
+
+ENDFORM.
+*---------------------------------------------------------------------*
+* FORM EXTRACT_DEPENDENCIES (from statements + capture PERFORMs)
+*---------------------------------------------------------------------*
+FORM EXTRACT_DEPENDENCIES USING    P_PARENT TYPE RS38L_FNAM
+                                   PT_SRC   TYPE TY_STRINGTAB
+                          CHANGING CT_EDGES TYPE TY_EDGE_TAB
+                                   CT_PERF  TYPE TY_PERF_TAB.
+  DATA: LT_STM  TYPE TY_STRINGTAB,
+        LV_STMT TYPE STRING,
+        LV_U    TYPE STRING,
+        LV_FM   TYPE STRING,
+        LV_A    TYPE STRING,
+        LV_B    TYPE STRING,
+        LS_EDGE TYPE TY_EDGE,
+        LS_PERF TYPE TY_PERF_REF.
+
+  REFRESH CT_EDGES.
+  REFRESH CT_PERF.
+
+  PERFORM ASSEMBLE_STATEMENTS USING PT_SRC CHANGING LT_STM.
+
+  LOOP AT LT_STM INTO LV_STMT.
+    LV_U = LV_STMT.
+    TRANSLATE LV_U TO UPPER CASE.
+
+    IF LV_U CS 'CALL FUNCTION'.
+      CLEAR LV_FM.
+      FIND REGEX 'CALL FUNCTION\s+''?(\w+)''?' IN LV_U SUBMATCHES LV_FM.
+      IF SY-SUBRC = 0 AND LV_FM IS NOT INITIAL.
+        CLEAR LS_EDGE.
+        LS_EDGE-PARENT = P_PARENT.
+        LS_EDGE-KIND   = 'FM'.
+        LS_EDGE-CHILD  = LV_FM.
+        APPEND LS_EDGE TO CT_EDGES.
+      ENDIF.
+    ENDIF.
+
+    CLEAR: LV_A, LV_B.
+    FIND REGEX 'PERFORM\s+(\w+)\s+IN\s+PROGRAM\s+(\w+)' IN LV_U SUBMATCHES LV_A LV_B.
+    IF SY-SUBRC = 0 AND LV_A IS NOT INITIAL AND LV_B IS NOT INITIAL.
+      CLEAR LS_PERF.
+      LS_PERF-FORM = LV_A.
+      LS_PERF-PROG = LV_B.
+      APPEND LS_PERF TO CT_PERF.
+      CONTINUE.
+    ENDIF.
+
+    CLEAR LV_A.
+    FIND REGEX 'PERFORM\s+(\w+)' IN LV_U SUBMATCHES LV_A.
+    IF SY-SUBRC = 0 AND LV_A IS NOT INITIAL AND LV_A <> 'IN'.
+      CLEAR LS_PERF.
+      LS_PERF-FORM = LV_A.
+      CLEAR LS_PERF-PROG.
+      APPEND LS_PERF TO CT_PERF.
+    ENDIF.
+  ENDLOOP.
+
+  SORT CT_PERF BY FORM PROG.
+  DELETE ADJACENT DUPLICATES FROM CT_PERF COMPARING FORM PROG.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM RESOLVE_PERFORMS (scan FORM blocks only)
+*---------------------------------------------------------------------*
+FORM RESOLVE_PERFORMS USING    P_PARENT TYPE RS38L_FNAM
+                               P_MAIN   TYPE PROGNAME
+                               PT_PERF  TYPE TY_PERF_TAB
+                      CHANGING CT_EDGES TYPE TY_EDGE_TAB.
+  DATA: LT_TODO  TYPE TY_PERF_TAB,
+        LS_P     TYPE TY_PERF_REF,
+        LS_DONE  TYPE TY_PERF_REF,
+        LV_PROG  TYPE PROGNAME,
+        LV_INC   TYPE PROGNAME,
+        LT_INC   TYPE STANDARD TABLE OF PROGNAME WITH DEFAULT KEY,
+        LT_BLOCK TYPE TY_STRINGTAB,
+        LV_FOUND TYPE C,
+        LT_E2    TYPE TY_EDGE_TAB,
+        LT_P2    TYPE TY_PERF_TAB,
+        LS_E2    TYPE TY_EDGE,
+        LS_P2    TYPE TY_PERF_REF,
+        LV_MSG   TYPE STRING.
+
+  DATA: LS_CACHE TYPE TY_FORM_CACHE.
+  DATA: LV_PROCESSED TYPE I.
+
+  LV_PROCESSED = 0.
+  LT_TODO = PT_PERF.
+
+  WHILE LT_TODO IS NOT INITIAL.
+    "Hard safety cap
+    LV_PROCESSED = LV_PROCESSED + 1.
+    IF LV_PROCESSED > 8000.
+      CLEAR LV_MSG.
+      CONCATENATE 'PERFORM resolution stopped after 8000 items (safety cap) for'
+                  P_PARENT INTO LV_MSG SEPARATED BY SPACE.
+      APPEND LV_MSG TO GT_MISSING.
+      EXIT.
+    ENDIF.
+
+    READ TABLE LT_TODO INTO LS_P INDEX 1.
+    DELETE LT_TODO INDEX 1.
+
+    "Program resolution
+    IF LS_P-PROG IS INITIAL.
+      LV_PROG = P_MAIN.
+    ELSE.
+      LV_PROG = LS_P-PROG.
+    ENDIF.
+
+    "Visited guard
+    READ TABLE GT_DONE_PERF INTO LS_DONE WITH KEY FORM = LS_P-FORM PROG = LV_PROG.
+    IF SY-SUBRC = 0.
+      CONTINUE.
+    ENDIF.
+    CLEAR LS_DONE.
+    LS_DONE-FORM = LS_P-FORM.
+    LS_DONE-PROG = LV_PROG.
+    APPEND LS_DONE TO GT_DONE_PERF.
+
+    "Cache lookup
+    CLEAR LV_INC.
+    READ TABLE GT_FORM_CACHE INTO LS_CACHE WITH KEY PROG = LV_PROG FORM = LS_P-FORM.
+    IF SY-SUBRC = 0 AND LS_CACHE-INCLUDE IS NOT INITIAL.
+      LV_INC = LS_CACHE-INCLUDE.
+    ENDIF.
+
+    "Search includes for FORM if not cached
+    IF LV_INC IS INITIAL.
+      REFRESH LT_INC.
+      CALL FUNCTION 'RS_GET_ALL_INCLUDES'
+        EXPORTING
+          PROGRAM    = LV_PROG
+        TABLES
+          INCLUDETAB = LT_INC
+        EXCEPTIONS
+          OTHERS     = 1.
+      IF SY-SUBRC <> 0.
+        CONTINUE.
+      ENDIF.
+
+      LOOP AT LT_INC INTO LV_INC.
+        REFRESH LT_BLOCK.
+        LV_FOUND = SPACE.
+        PERFORM GET_FORM_BLOCK USING LV_INC LS_P-FORM CHANGING LT_BLOCK LV_FOUND.
+        IF LV_FOUND = 'X'.
+          EXIT.
+        ENDIF.
+        CLEAR LV_INC.
+      ENDLOOP.
+
+      "Write cache (even if initial)
+      CLEAR LS_CACHE.
+      LS_CACHE-PROG    = LV_PROG.
+      LS_CACHE-FORM    = LS_P-FORM.
+      LS_CACHE-INCLUDE = LV_INC.
+      APPEND LS_CACHE TO GT_FORM_CACHE.
+    ENDIF.
+
+    IF LV_INC IS INITIAL.
+      CONTINUE.
+    ENDIF.
+
+    "Load block if not already loaded
+    IF LT_BLOCK IS INITIAL.
+      REFRESH LT_BLOCK.
+      LV_FOUND = SPACE.
+      PERFORM GET_FORM_BLOCK USING LV_INC LS_P-FORM CHANGING LT_BLOCK LV_FOUND.
+      IF LV_FOUND <> 'X'.
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+
+    "Extract deps from the FORM block
+    REFRESH LT_E2.
+    REFRESH LT_P2.
+    PERFORM EXTRACT_DEPENDENCIES USING P_PARENT LT_BLOCK CHANGING LT_E2 LT_P2.
+    APPEND LINES OF LT_E2 TO CT_EDGES.
+
+    "Queue nested performs
+    LOOP AT LT_P2 INTO LS_P2.
+      APPEND LS_P2 TO LT_TODO.
+    ENDLOOP.
+  ENDWHILE.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM DUMP_INTERFACE (DDIC enrichment)
+*---------------------------------------------------------------------*
+FORM DUMP_INTERFACE USING P_FM    TYPE RS38L_FNAM
+                           P_FOLDER TYPE CHAR200.
+  DATA: LT_IMP TYPE STANDARD TABLE OF RSIMP WITH DEFAULT KEY,
+        LT_EXP TYPE STANDARD TABLE OF RSEXP WITH DEFAULT KEY,
+        LT_TAB TYPE STANDARD TABLE OF RSTBL WITH DEFAULT KEY,
+        LT_EXC TYPE STANDARD TABLE OF RSEXC WITH DEFAULT KEY.
+
+  DATA: LT_OUT   TYPE TY_STRINGTAB,
+        LT_DFIES TYPE STANDARD TABLE OF DFIES WITH DEFAULT KEY,
+        LS_DFIES TYPE DFIES,
+        LS_DD04V TYPE DD04V,
+        LV_LINE  TYPE STRING,
+        LV_TYP   TYPE ROLLNAME.
+
+  DATA: LS_IMP TYPE RSIMP,
+        LS_EXP TYPE RSEXP,
+        LS_TAB TYPE RSTBL,
+        LS_EXC TYPE RSEXC.
+
+  DATA: LV_SUBRC_TXT TYPE CHAR20.
+
+  REFRESH: LT_IMP, LT_EXP, LT_TAB, LT_EXC, LT_OUT.
+
+  CALL FUNCTION 'FUNCTION_IMPORT_INTERFACE'
+    EXPORTING
+      FUNCNAME         = P_FM
+    TABLES
+      IMPORT_PARAMETER = LT_IMP
+      EXPORT_PARAMETER = LT_EXP
+      TABLES_PARAMETER = LT_TAB
+      EXCEPTION_LIST   = LT_EXC
+    EXCEPTIONS
+      ERROR_MESSAGE    = 1
+                         FUNCTION_NOT_FOUND= 2
+      INVALID_NAME     = 3
+      OTHERS           = 4.
+  IF SY-SUBRC <> 0.
+    CLEAR: LV_LINE, LV_SUBRC_TXT.
+    WRITE SY-SUBRC TO LV_SUBRC_TXT.
+    CONCATENATE 'FUNCTION_IMPORT_INTERFACE failed for'
+                P_FM 'subrc=' LV_SUBRC_TXT
+           INTO LV_LINE SEPARATED BY SPACE.
+    APPEND LV_LINE TO LT_OUT.
+    PERFORM DOWNLOAD_FILE_TO_FOLDER USING P_FOLDER 'INTERFACE' LT_OUT.
+    RETURN.
+  ENDIF.
+
+  APPEND '=== IMPORTING ===' TO LT_OUT.
+  LOOP AT LT_IMP INTO LS_IMP.
+    CLEAR LV_LINE.
+    CONCATENATE LS_IMP-PARAMETER ' TYPE ' LS_IMP-TYP INTO LV_LINE.
+    IF LS_IMP-OPTIONAL = 'X'.
+      CONCATENATE LV_LINE ' OPTIONAL' INTO LV_LINE.
+    ENDIF.
+    APPEND LV_LINE TO LT_OUT.
+
+    LV_TYP = LS_IMP-TYP.
+    IF LV_TYP IS NOT INITIAL.
+      CLEAR LS_DD04V.
+      CALL FUNCTION 'DDIF_DTEL_GET'
+        EXPORTING
+          NAME          = LV_TYP
+          STATE         = 'A'
+          LANGU         = SY-LANGU
+        IMPORTING
+          DD04V_WA      = LS_DD04V
+        EXCEPTIONS
+          ILLEGAL_INPUT = 1
+          OTHERS        = 2.
+      IF SY-SUBRC = 0 AND LS_DD04V-ROLLNAME IS NOT INITIAL.
+        CLEAR LV_LINE.
+        CONCATENATE '  DTEL:' LS_DD04V-ROLLNAME LS_DD04V-DDTEXT
+                    'DOM=' LS_DD04V-DOMNAME
+                    'DT='  LS_DD04V-DATATYPE
+                    'LEN=' LS_DD04V-LENG
+                    'DEC=' LS_DD04V-DECIMALS
+               INTO LV_LINE SEPARATED BY SPACE.
+        APPEND LV_LINE TO LT_OUT.
+      ELSE.
+        REFRESH LT_DFIES.
+        CALL FUNCTION 'DDIF_FIELDINFO_GET'
+          EXPORTING
+            TABNAME        = LV_TYP
+            LANGU          = SY-LANGU
+            ALL_TYPES      = 'X'
+          TABLES
+            DFIES_TAB      = LT_DFIES
+          EXCEPTIONS
+            NOT_FOUND      = 1
+            INTERNAL_ERROR = 2
+            OTHERS         = 3.
+        IF SY-SUBRC = 0 AND LT_DFIES IS NOT INITIAL.
+          APPEND '  -- TYPE FIELDS --' TO LT_OUT.
+          LOOP AT LT_DFIES INTO LS_DFIES.
+            CLEAR LV_LINE.
+            CONCATENATE '   ' LS_DFIES-FIELDNAME 'DE=' LS_DFIES-ROLLNAME LS_DFIES-SCRTEXT_M
+                        INTO LV_LINE SEPARATED BY SPACE.
+            APPEND LV_LINE TO LT_OUT.
+          ENDLOOP.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  APPEND '' TO LT_OUT.
+  APPEND '=== EXPORTING ===' TO LT_OUT.
+  LOOP AT LT_EXP INTO LS_EXP.
+    CLEAR LV_LINE.
+    CONCATENATE LS_EXP-PARAMETER ' TYPE ' LS_EXP-TYP INTO LV_LINE.
+    APPEND LV_LINE TO LT_OUT.
+  ENDLOOP.
+
+  APPEND '' TO LT_OUT.
+  APPEND '=== TABLES ===' TO LT_OUT.
+  LOOP AT LT_TAB INTO LS_TAB.
+    CLEAR LV_LINE.
+    CONCATENATE LS_TAB-PARAMETER ' TYPE ' LS_TAB-TYP INTO LV_LINE.
+    APPEND LV_LINE TO LT_OUT.
+  ENDLOOP.
+
+  APPEND '' TO LT_OUT.
+  APPEND '=== EXCEPTIONS ===' TO LT_OUT.
+  LOOP AT LT_EXC INTO LS_EXC.
+    APPEND LS_EXC-EXCEPTION TO LT_OUT.
+  ENDLOOP.
+
+  PERFORM DOWNLOAD_FILE_TO_FOLDER USING P_FOLDER 'INTERFACE' LT_OUT.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* NEW: FORM BUILD_UXX_OVERVIEW (synthetic UXX include summary)
+*---------------------------------------------------------------------*
+FORM BUILD_UXX_OVERVIEW USING    P_AREA   TYPE RS38L_AREA
+                                 P_FOLDER TYPE CHAR200.
+  DATA: LT_FUNCTAB   TYPE STANDARD TABLE OF RS38L_INCL WITH DEFAULT KEY,
+        LS_FUNCTAB   TYPE RS38L_INCL,
+        LT_OUT       TYPE TY_STRINGTAB,
+        LV_LINE      TYPE STRING,
+        LV_UXX       TYPE PROGNAME,
+        LV_SUBRC_TXT TYPE CHAR20.
+
+  REFRESH: LT_FUNCTAB, LT_OUT.
+
+  CALL FUNCTION 'RS_FUNCTION_POOL_CONTENTS'
+    EXPORTING
+      FUNCTION_POOL           = P_AREA
+    TABLES
+      FUNCTAB                 = LT_FUNCTAB
+    EXCEPTIONS
+      FUNCTION_POOL_NOT_FOUND = 1
+      OTHERS                  = 2.
+  IF SY-SUBRC <> 0 OR LT_FUNCTAB IS INITIAL.
+    CLEAR: LV_LINE, LV_SUBRC_TXT.
+    WRITE SY-SUBRC TO LV_SUBRC_TXT.
+    CONCATENATE 'RS_FUNCTION_POOL_CONTENTS failed for'
+                P_AREA 'subrc=' LV_SUBRC_TXT
+           INTO LV_LINE SEPARATED BY SPACE.
+    APPEND LV_LINE TO GT_MISSING.
+    RETURN.
+  ENDIF.
+
+  SORT LT_FUNCTAB BY INCLUDE FUNCNAME.
+
+  CONCATENATE 'L' P_AREA 'UXX' INTO LV_UXX.
+
+  APPEND '* Synthetic overview generated by ZBW_FM_EXTRACTION_MASTER' TO LT_OUT.
+  CLEAR LV_LINE.
+  CONCATENATE '* Function Group:' P_AREA INTO LV_LINE SEPARATED BY SPACE.
+  APPEND LV_LINE TO LT_OUT.
+  APPEND '' TO LT_OUT.
+
+  LOOP AT LT_FUNCTAB INTO LS_FUNCTAB.
+    CLEAR LV_LINE.
+    CONCATENATE 'INCLUDE' LS_FUNCTAB-INCLUDE '.' INTO LV_LINE SEPARATED BY SPACE.
+    CONCATENATE LV_LINE '"' LS_FUNCTAB-FUNCNAME INTO LV_LINE SEPARATED BY SPACE.
+    APPEND LV_LINE TO LT_OUT.
+  ENDLOOP.
+
+  DELETE ADJACENT DUPLICATES FROM LT_OUT.
+
+  PERFORM DOWNLOAD_FILE_TO_FOLDER USING P_FOLDER LV_UXX LT_OUT.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* OPTIONAL: FORM DUMP_UXX_CSV (semicolon-separated mapping)
+*---------------------------------------------------------------------*
+FORM DUMP_UXX_CSV USING    P_AREA   TYPE RS38L_AREA
+                           P_FOLDER TYPE CHAR200.
+  DATA: LT_FUNCTAB TYPE STANDARD TABLE OF RS38L_INCL WITH DEFAULT KEY,
+        LS_FUNCTAB TYPE RS38L_INCL,
+        LT_OUT     TYPE TY_STRINGTAB,
+        LV_FILE    TYPE PROGNAME,
+        LV_LINE    TYPE STRING.
+
+  REFRESH: LT_FUNCTAB, LT_OUT.
+
+  CALL FUNCTION 'RS_FUNCTION_POOL_CONTENTS'
+    EXPORTING
+      FUNCTION_POOL = P_AREA
+    TABLES
+      FUNCTAB       = LT_FUNCTAB
+    EXCEPTIONS
+      OTHERS        = 1.
+  IF SY-SUBRC <> 0 OR LT_FUNCTAB IS INITIAL.
+    RETURN.
+  ENDIF.
+
+  APPEND 'Include;FunctionModule' TO LT_OUT.
+  SORT LT_FUNCTAB BY INCLUDE FUNCNAME.
+  LOOP AT LT_FUNCTAB INTO LS_FUNCTAB.
+    CLEAR LV_LINE.
+    CONCATENATE LS_FUNCTAB-INCLUDE ';' LS_FUNCTAB-FUNCNAME INTO LV_LINE.
+    APPEND LV_LINE TO LT_OUT.
+  ENDLOOP.
+
+  CONCATENATE 'L' P_AREA 'UXX_MAP' INTO LV_FILE.
+  PERFORM DOWNLOAD_FILE_TO_FOLDER USING P_FOLDER LV_FILE LT_OUT.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM IS_STANDARD_FM – classifies SAP/BW/system FMs as standard
+*---------------------------------------------------------------------*
+*FORM IS_STANDARD_FM USING    P_FM  TYPE RS38L_FNAM
+*                    CHANGING P_STD TYPE ABAP_BOOL.
+*  DATA LV TYPE STRING.
+*  LV = P_FM.
+*  TRANSLATE LV TO UPPER CASE.
+*
+*  IF LV CP 'R*'
+*  OR LV CP 'RS*'
+*  OR LV CP 'RR*'
+*  OR LV CP 'DD*'
+*  OR LV CP 'ENQUEUE*'
+*  OR LV CP 'DEQUEUE*'
+*  OR LV CP 'TR*'
+*  OR LV CP 'S*'
+*  OR LV CP 'CL_*'
+*  OR LV CP 'SAP*'.
+*    P_STD = ABAP_TRUE.
+*  ELSE.
+*    P_STD = ABAP_FALSE.
+*  ENDIF.
+*ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM APPEND_SKIPPED_STD_EDGE – writes Option-B skip line and counts
+*---------------------------------------------------------------------*
+FORM APPEND_SKIPPED_STD_EDGE USING P_PARENT TYPE RS38L_FNAM
+                                   P_CHILD  TYPE RS38L_FNAM.
+  DATA LV_LINE TYPE STRING.
+
+  CLEAR LV_LINE.
+  CONCATENATE 'SKIPPED:' P_PARENT '->' P_CHILD '[FM] depth-limit'
+    INTO LV_LINE SEPARATED BY SPACE.
+
+  APPEND LV_LINE TO GT_TREE.
+  APPEND LV_LINE TO GT_EDGES_TXT.
+
+  GV_STD_SKIPPED_COUNT = GV_STD_SKIPPED_COUNT + 1.
+ENDFORM.
+
+
+*---------------------------------------------------------------------*
+* FORM PROCESS_FM (main processing per FM)
+*---------------------------------------------------------------------*
+*---------------------------------------------------------------------*
+* FORM PROCESS_FM – main processing per FM
+*---------------------------------------------------------------------*
+FORM PROCESS_FM USING P_FM TYPE RS38L_FNAM
+                     P_LEVEL TYPE I.
+
+  DATA: LV_AREA   TYPE RS38L_AREA,
+        LV_MAIN   TYPE PROGNAME,
+        LV_INC    TYPE PROGNAME,
+        LV_FOLDER TYPE CHAR200.
+
+  DATA: LT_SRC    TYPE TY_STRINGTAB,
+        LT_EDGES  TYPE TY_EDGE_TAB,
+        LT_DEPOUT TYPE TY_STRINGTAB,
+        LT_PERF   TYPE TY_PERF_TAB.
+
+  DATA: LV_INDENT  TYPE STRING,
+        LV_LINE    TYPE STRING,
+        LV_NEXT    TYPE I,
+        LV_CNT_TXT TYPE CHAR20,
+        LV_MAX_TXT TYPE CHAR20.
+
+  DATA: LS_E TYPE TY_EDGE,
+        LS_R TYPE TY_EDGE.
+
+  "---------------------------------------------------------
+  " Global FM limit check (before any work)
+  "---------------------------------------------------------
+  IF GV_LIMIT_REACHED = 'X' OR GV_FM_COUNT >= GV_MAXFM.
+    IF GV_LIMIT_REACHED <> 'X'.
+      GV_LIMIT_REACHED = 'X'.
+      CLEAR: LV_LINE, LV_CNT_TXT, LV_MAX_TXT.
+      WRITE GV_FM_COUNT TO LV_CNT_TXT.
+      WRITE GV_MAXFM     TO LV_MAX_TXT.
+
+      CONCATENATE '== FM processing limit reached: processed'
+                  LV_CNT_TXT 'of' LV_MAX_TXT '=='
+                  INTO LV_LINE SEPARATED BY SPACE.
+      APPEND LV_LINE TO GT_TREE.
+      APPEND LV_LINE TO GT_MISSING.
+    ENDIF.
+
+    PERFORM BUILD_INDENT USING P_LEVEL CHANGING LV_INDENT.
+    CLEAR LV_LINE.
+    CONCATENATE LV_INDENT P_FM '(skipped due to limit)'
+        INTO LV_LINE SEPARATED BY SPACE.
+    APPEND LV_LINE TO GT_TREE.
+    RETURN.
+  ENDIF.
+
+  "---------------------------------------------------------
+  " Visited guard
+  "---------------------------------------------------------
+  READ TABLE GT_VISITED_FM WITH KEY TABLE_LINE = P_FM TRANSPORTING NO FIELDS.
+  IF SY-SUBRC = 0.
+    PERFORM BUILD_INDENT USING P_LEVEL CHANGING LV_INDENT.
+    CLEAR LV_LINE.
+    CONCATENATE LV_INDENT P_FM '(already processed)'
+        INTO LV_LINE SEPARATED BY SPACE.
+    APPEND LV_LINE TO GT_TREE.
+    RETURN.
+  ENDIF.
+
+  "---------------------------------------------------------
+  " Mark this FM visited
+  "---------------------------------------------------------
+  APPEND P_FM TO GT_VISITED_FM.
+  GV_FM_COUNT = GV_FM_COUNT + 1.
+
+  "---------------------------------------------------------
+  " Locate the include containing the FM code
+  "---------------------------------------------------------
+  PERFORM GET_FM_INCLUDE USING P_FM CHANGING LV_AREA LV_MAIN LV_INC.
+  IF LV_INC IS INITIAL.
+    CLEAR LV_LINE.
+    CONCATENATE 'FM include not found for' P_FM INTO LV_LINE SEPARATED BY SPACE.
+    APPEND LV_LINE TO GT_MISSING.
+    RETURN.
+  ENDIF.
+
+  "---------------------------------------------------------
+  " Prepare FM folder
+  "---------------------------------------------------------
+  CONCATENATE GV_BASE_FOLDER GV_SEP P_FM INTO LV_FOLDER.
+  PERFORM DIR_CREATE_SAFE USING LV_FOLDER.
+
+  PERFORM BUILD_INDENT USING P_LEVEL CHANGING LV_INDENT.
+  CLEAR LV_LINE.
+  CONCATENATE LV_INDENT P_FM INTO LV_LINE SEPARATED BY SPACE.
+  APPEND LV_LINE TO GT_TREE.
+
+  "---------------------------------------------------------
+  " Skip heavy FG dumps for nested standard FMs
+  "---------------------------------------------------------
+  DATA LV_STD_HERE TYPE ABAP_BOOL.
+  PERFORM IS_STANDARD_FM USING P_FM CHANGING LV_STD_HERE.
+
+  IF LV_STD_HERE = ABAP_TRUE AND GV_STD_DEPTH > 0.
+    "Do nothing (skip FG include dump)
+  ELSE.
+    PERFORM DUMP_FG_INCLUDES_FILTERED USING LV_FOLDER LV_MAIN.
+
+    IF LV_AREA IS NOT INITIAL.
+      PERFORM BUILD_UXX_OVERVIEW USING LV_AREA LV_FOLDER.
+    ENDIF.
+  ENDIF.
+
+  "---------------------------------------------------------
+  " *** DOWNLOAD THE ACTUAL FM INCLUDE (FIX) ***
+  "---------------------------------------------------------
+  IF LV_INC IS NOT INITIAL.
+    DATA LT_SRC_FM TYPE TY_STRINGTAB.
+    REFRESH LT_SRC_FM.
+    READ REPORT LV_INC INTO LT_SRC_FM.
+    IF SY-SUBRC = 0.
+      PERFORM DOWNLOAD_FILE_TO_FOLDER USING LV_FOLDER LV_INC LT_SRC_FM.
+    ENDIF.
+  ENDIF.
+
+  "---------------------------------------------------------
+  " Read FM include and extract dependencies
+  "---------------------------------------------------------
+  REFRESH LT_SRC.
+  READ REPORT LV_INC INTO LT_SRC.
+
+  IF SY-SUBRC <> 0.
+    CLEAR LV_LINE.
+    CONCATENATE 'MISSING FM INCLUDE:' LV_INC 'for' P_FM
+        INTO LV_LINE SEPARATED BY SPACE.
+    APPEND LV_LINE TO GT_MISSING.
+  ELSE.
+    REFRESH LT_EDGES.
+    REFRESH LT_PERF.
+
+    PERFORM EXTRACT_DEPENDENCIES USING P_FM LT_SRC
+                                CHANGING LT_EDGES LT_PERF.
+
+    IF LT_PERF IS NOT INITIAL.
+      PERFORM RESOLVE_PERFORMS USING P_FM LV_MAIN LT_PERF
+                              CHANGING LT_EDGES.
+    ENDIF.
+
+    SORT LT_EDGES BY PARENT KIND CHILD.
+    DELETE ADJACENT DUPLICATES FROM LT_EDGES COMPARING PARENT KIND CHILD.
+
+    "-----------------------------------------------------
+    " Write dependency file
+    "-----------------------------------------------------
+    REFRESH LT_DEPOUT.
+    APPEND 'DEPENDENCIES (statement + FORM block scan):' TO LT_DEPOUT.
+
+    LOOP AT LT_EDGES INTO LS_E.
+      CLEAR LV_LINE.
+      CONCATENATE LS_E-KIND ':' LS_E-CHILD INTO LV_LINE SEPARATED BY SPACE.
+      APPEND LV_LINE TO LT_DEPOUT.
+
+      CLEAR LV_LINE.
+      CONCATENATE LS_E-PARENT '->' LS_E-CHILD '[' LS_E-KIND ']'
+          INTO LV_LINE SEPARATED BY SPACE.
+      APPEND LV_LINE TO GT_EDGES_TXT.
+    ENDLOOP.
+
+    PERFORM DOWNLOAD_FILE_TO_FOLDER USING LV_FOLDER 'DEPENDENCIES' LT_DEPOUT.
+
+    "-----------------------------------------------------
+    " Recurse into child FM calls
+    "-----------------------------------------------------
+    LV_NEXT = P_LEVEL + 1.
+
+    LOOP AT LT_EDGES INTO LS_R.
+      IF LS_R-KIND = 'FM'.
+
+        "1. Standard FM detection
+        DATA LV_STD TYPE ABAP_BOOL.
+        PERFORM IS_STANDARD_FM USING LS_R-CHILD CHANGING LV_STD.
+
+        IF LV_STD = ABAP_TRUE.
+          "Stop if depth reached
+          IF GV_STD_DEPTH >= GV_STD_DEPTH_MAX.
+            PERFORM APPEND_SKIPPED_STD_EDGE USING P_FM LS_R-CHILD.
+            CONTINUE.
+          ENDIF.
+
+          "Increase depth for this branch only
+          GV_STD_DEPTH = GV_STD_DEPTH + 1.
+          PERFORM PROCESS_FM USING LS_R-CHILD LV_NEXT.
+          GV_STD_DEPTH = GV_STD_DEPTH - 1.
+          CONTINUE.
+        ENDIF.
+
+        "2. Global limit
+        IF GV_LIMIT_REACHED = 'X' OR GV_FM_COUNT >= GV_MAXFM.
+          PERFORM BUILD_INDENT USING LV_NEXT CHANGING LV_INDENT.
+          CLEAR LV_LINE.
+          CONCATENATE LV_INDENT LS_R-CHILD '(skipped due to FM limit)'
+              INTO LV_LINE SEPARATED BY SPACE.
+          APPEND LV_LINE TO GT_TREE.
+          CONTINUE.
+        ENDIF.
+
+        "3. Normal recursion
+        PERFORM PROCESS_FM USING LS_R-CHILD LV_NEXT.
+
+      ENDIF.
+    ENDLOOP.
+
+  ENDIF.
+
+  "Dump FM interface
+  PERFORM DUMP_INTERFACE USING P_FM LV_FOLDER.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* JSON CONSTANTS (old-kernel safe)
+*---------------------------------------------------------------------*
+CONSTANTS:
+  GC_LBRACE TYPE C VALUE '{',
+  GC_RBRACE TYPE C VALUE '}',
+  GC_LBRACK TYPE C VALUE '[',
+  GC_RBRACK TYPE C VALUE ']',
+  GC_QUOTE  TYPE C VALUE '"',
+  GC_COLON  TYPE C VALUE ':',
+  GC_COMMA  TYPE C VALUE ','.
+
+*---------------------------------------------------------------------*
+* TYPES for parent->child pairs
+*---------------------------------------------------------------------*
+TYPES: TY_PAIR_PARENT TYPE RS38L_FNAM,
+       TY_PAIR_CHILD  TYPE RS38L_FNAM.
+
+TYPES: BEGIN OF TY_PAIR,
+         PARENT TYPE TY_PAIR_PARENT,
+         CHILD  TYPE TY_PAIR_CHILD,
+       END OF TY_PAIR.
+
+TYPES: TY_PAIR_TAB TYPE STANDARD TABLE OF TY_PAIR WITH DEFAULT KEY.
+
+*---------------------------------------------------------------------*
+* Download helper for .json extension
+*---------------------------------------------------------------------*
+FORM DOWNLOAD_FILE_JSON_TO_FOLDER USING P_FOLDER TYPE CHAR200
+                                        P_NAME   TYPE RS38L_FNAM
+                                        PT_TAB   TYPE TY_STRINGTAB.
+  DATA LV_FILE TYPE STRING.
+  CONCATENATE P_FOLDER GV_SEP P_NAME '.json' INTO LV_FILE.
+  PERFORM GUI_DOWNLOAD_SAFE USING LV_FILE PT_TAB.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* Parse GT_EDGES_TXT -> pairs (ROBUST to: A -> B [ FM ])
+*---------------------------------------------------------------------*
+*---------------------------------------------------------------------*
+* FORM PARSE_EDGES_TO_PAIRS  (ROBUST & BOUNDS-SAFE)
+* Parses GT_EDGES_TXT lines like:
+*   PARENT -> CHILD [ FM ]
+*   PARENT -> CHILD [FM] (stopped – standard FM depth limit reached)
+*   (tolerates spaces and comments)
+*---------------------------------------------------------------------*
+*---------------------------------------------------------------------*
+* FORM PARSE_EDGES_TO_PAIRS  (ROBUST & BOUNDS-SAFE)
+*---------------------------------------------------------------------*
+FORM PARSE_EDGES_TO_PAIRS CHANGING CT_PAIRS TYPE TY_PAIR_TAB.
+  DATA: LV_LINE  TYPE STRING,
+        LV_LEFT  TYPE STRING,
+        LV_RIGHT TYPE STRING,
+        LV_POS   TYPE I,
+        LV_BRK   TYPE I,
+        LS_P     TYPE TY_PAIR.
+  FIELD-SYMBOLS <L> TYPE STRING.
+
+  REFRESH CT_PAIRS.
+
+  LOOP AT GT_EDGES_TXT ASSIGNING <L>.
+    LV_LINE = <L>.
+    IF LV_LINE IS INITIAL.
+      CONTINUE.
+    ENDIF.
+    SHIFT LV_LINE LEFT DELETING LEADING SPACE.
+    IF LV_LINE IS INITIAL OR LV_LINE+0(1) = '*' OR LV_LINE+0(1) = '"'.
+      CONTINUE.
+    ENDIF.
+
+    "Find '->' safely
+    CLEAR LV_POS.
+    FIND '->' IN LV_LINE MATCH OFFSET LV_POS.
+    IF SY-SUBRC <> 0.
+      CONTINUE.
+    ENDIF.
+
+    IF LV_POS > 0 AND LV_POS <= STRLEN( LV_LINE ).
+      LV_LEFT = LV_LINE(LV_POS).
+    ELSE.
+      CONTINUE.
+    ENDIF.
+
+    DATA(LV_START_RIGHT) = LV_POS + 2.
+    IF LV_START_RIGHT >= STRLEN( LV_LINE ).
+      CONTINUE.
+    ENDIF.
+    LV_RIGHT = LV_LINE+LV_START_RIGHT.
+
+    CLEAR LV_BRK.
+    FIND '[' IN LV_RIGHT MATCH OFFSET LV_BRK.
+    IF SY-SUBRC = 0 AND LV_BRK > 0 AND LV_BRK <= STRLEN( LV_RIGHT ).
+      LV_RIGHT = LV_RIGHT(LV_BRK).
+    ENDIF.
+
+    SHIFT LV_LEFT  RIGHT DELETING TRAILING SPACE.
+    SHIFT LV_LEFT  LEFT  DELETING LEADING SPACE.
+    SHIFT LV_RIGHT RIGHT DELETING TRAILING SPACE.
+    SHIFT LV_RIGHT LEFT  DELETING LEADING SPACE.
+
+    IF LV_LEFT IS INITIAL OR LV_RIGHT IS INITIAL.
+      CONTINUE.
+    ENDIF.
+
+    CLEAR LS_P.
+    LS_P-PARENT = LV_LEFT.
+    LS_P-CHILD  = LV_RIGHT.
+    APPEND LS_P TO CT_PAIRS.
+  ENDLOOP.
+
+  SORT CT_PAIRS BY PARENT CHILD.
+  DELETE ADJACENT DUPLICATES FROM CT_PAIRS COMPARING PARENT CHILD.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* Build child list
+*---------------------------------------------------------------------*
+FORM BUILD_CHILD_LIST USING    P_PARENT    TYPE RS38L_FNAM
+                      CHANGING CT_CHILDREN TYPE TY_FM_TAB
+                               CT_PAIRS    TYPE TY_PAIR_TAB.
+  DATA LS_P TYPE TY_PAIR.
+
+  REFRESH CT_CHILDREN.
+
+  LOOP AT CT_PAIRS INTO LS_P WHERE PARENT = P_PARENT.
+    APPEND LS_P-CHILD TO CT_CHILDREN.
+  ENDLOOP.
+
+  SORT CT_CHILDREN.
+  DELETE ADJACENT DUPLICATES FROM CT_CHILDREN.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* Emit JSON node (recursive)
+*---------------------------------------------------------------------*
+FORM EMIT_JSON_NODE USING    P_FM     TYPE RS38L_FNAM
+                             P_INDENT TYPE I
+                             PT_PAIRS TYPE TY_PAIR_TAB
+                    CHANGING PT_JSON  TYPE TY_STRINGTAB.
+
+  DATA: LV_IND      TYPE STRING,
+        LV_IND2     TYPE STRING,
+        LV_LINE     TYPE STRING,
+        LT_KIDS     TYPE TY_FM_TAB,
+        LV_CHILD    TYPE RS38L_FNAM,
+        LV_COUNT    TYPE I,
+        LV_I        TYPE I,
+        LV_IND_NEXT TYPE I.
+
+  CLEAR LV_IND.
+  CLEAR LV_IND2.
+
+  PERFORM BUILD_INDENT USING P_INDENT CHANGING LV_IND.
+  PERFORM BUILD_INDENT USING P_INDENT CHANGING LV_IND2.
+
+  "Add 2 spaces manually (old kernel safe)
+  CONCATENATE LV_IND2 ' ' INTO LV_IND2.
+  CONCATENATE LV_IND2 ' ' INTO LV_IND2.
+
+  CONCATENATE LV_IND GC_LBRACE INTO LV_LINE.
+  APPEND LV_LINE TO PT_JSON.
+
+  CONCATENATE LV_IND2 GC_QUOTE 'fm' GC_QUOTE GC_COLON GC_QUOTE P_FM GC_QUOTE
+    INTO LV_LINE SEPARATED BY SPACE.
+  APPEND LV_LINE TO PT_JSON.
+
+  CONCATENATE LV_IND2 GC_QUOTE 'children' GC_QUOTE GC_COLON GC_LBRACK
+    INTO LV_LINE SEPARATED BY SPACE.
+  APPEND LV_LINE TO PT_JSON.
+
+  REFRESH LT_KIDS.
+  PERFORM BUILD_CHILD_LIST USING P_FM CHANGING LT_KIDS PT_PAIRS.
+
+  DESCRIBE TABLE LT_KIDS LINES LV_COUNT.
+  CLEAR LV_I.
+
+  LOOP AT LT_KIDS INTO LV_CHILD.
+    ADD 1 TO LV_I.
+
+    LV_IND_NEXT = P_INDENT.
+    ADD 4 TO LV_IND_NEXT.
+
+    PERFORM EMIT_JSON_NODE USING LV_CHILD LV_IND_NEXT PT_PAIRS CHANGING PT_JSON.
+
+    IF LV_I < LV_COUNT.
+      CONCATENATE LV_IND2 GC_COMMA INTO LV_LINE.
+      APPEND LV_LINE TO PT_JSON.
+    ENDIF.
+
+  ENDLOOP.
+
+  CONCATENATE LV_IND2 GC_RBRACK INTO LV_LINE.
+  APPEND LV_LINE TO PT_JSON.
+
+  CONCATENATE LV_IND GC_RBRACE INTO LV_LINE.
+  APPEND LV_LINE TO PT_JSON.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* Build root JSON tree
+*---------------------------------------------------------------------*
+FORM BUILD_JSON_TREE USING    P_ROOT  TYPE RS38L_FNAM
+                     CHANGING PT_JSON TYPE TY_STRINGTAB.
+
+  DATA: LT_PAIRS TYPE TY_PAIR_TAB,
+        LT_KIDS  TYPE TY_FM_TAB,
+        LV_LINE  TYPE STRING,
+        LV_CNT   TYPE CHAR20,
+        LV_MAX   TYPE CHAR20,
+        LV_COUNT TYPE I,
+        LV_I     TYPE I,
+        LV_IND2  TYPE STRING,
+        LV_CHILD TYPE RS38L_FNAM.
+
+  REFRESH PT_JSON.
+
+  PERFORM PARSE_EDGES_TO_PAIRS CHANGING LT_PAIRS.
+
+  APPEND GC_LBRACE TO PT_JSON.
+
+  CLEAR LV_IND2.
+  CONCATENATE LV_IND2 ' ' INTO LV_IND2.
+  CONCATENATE LV_IND2 ' ' INTO LV_IND2.
+
+  CONCATENATE LV_IND2 GC_QUOTE 'fm' GC_QUOTE GC_COLON GC_QUOTE P_ROOT GC_QUOTE
+    INTO LV_LINE SEPARATED BY SPACE.
+  APPEND LV_LINE TO PT_JSON.
+
+  IF GV_LIMIT_REACHED = 'X'.
+    WRITE GV_FM_COUNT TO LV_CNT.
+    WRITE GV_MAXFM     TO LV_MAX.
+
+    CONCATENATE LV_IND2 GC_QUOTE 'limit_reached' GC_QUOTE GC_COLON GC_QUOTE 'true' GC_QUOTE
+      INTO LV_LINE SEPARATED BY SPACE.
+    APPEND LV_LINE TO PT_JSON.
+
+    CONCATENATE LV_IND2 GC_QUOTE 'processed_fms' GC_QUOTE GC_COLON GC_QUOTE LV_CNT GC_QUOTE
+      INTO LV_LINE SEPARATED BY SPACE.
+    APPEND LV_LINE TO PT_JSON.
+
+    CONCATENATE LV_IND2 GC_QUOTE 'max_limit' GC_QUOTE GC_COLON GC_QUOTE LV_MAX GC_QUOTE
+      INTO LV_LINE SEPARATED BY SPACE.
+    APPEND LV_LINE TO PT_JSON.
+  ENDIF.
+
+  CONCATENATE LV_IND2 GC_QUOTE 'children' GC_QUOTE GC_COLON GC_LBRACK
+    INTO LV_LINE SEPARATED BY SPACE.
+  APPEND LV_LINE TO PT_JSON.
+
+  PERFORM BUILD_CHILD_LIST USING P_ROOT CHANGING LT_KIDS LT_PAIRS.
+
+  DESCRIBE TABLE LT_KIDS LINES LV_COUNT.
+  CLEAR LV_I.
+
+  LOOP AT LT_KIDS INTO LV_CHILD.
+    ADD 1 TO LV_I.
+
+    PERFORM EMIT_JSON_NODE USING LV_CHILD 4 LT_PAIRS CHANGING PT_JSON.
+
+    IF LV_I < LV_COUNT.
+      CONCATENATE LV_IND2 GC_COMMA INTO LV_LINE.
+      APPEND LV_LINE TO PT_JSON.
+    ENDIF.
+
+  ENDLOOP.
+
+  CONCATENATE LV_IND2 GC_RBRACK INTO LV_LINE.
+  APPEND LV_LINE TO PT_JSON.
+
+  APPEND GC_RBRACE TO PT_JSON.
+
+ENDFORM.
+
+
+**---------------------------------------------------------------------*
+* FORM HANDLE_STANDARD_FM_LIMIT – pure check (no increment here)
+* Emits a detail line and sets P_STOP if depth already at limit
+*---------------------------------------------------------------------*
+FORM HANDLE_STANDARD_FM_LIMIT
+     USING    P_PARENT TYPE RS38L_FNAM
+              P_CHILD  TYPE RS38L_FNAM
+     CHANGING P_STOP   TYPE ABAP_BOOL.
+
+  P_STOP = ABAP_FALSE.
+
+  IF GV_STD_DEPTH >= GV_STD_DEPTH_MAX.
+    P_STOP = ABAP_TRUE.
+    PERFORM APPEND_SKIPPED_STD_EDGE USING P_PARENT P_CHILD.
+  ENDIF.
+
+ENDFORM.

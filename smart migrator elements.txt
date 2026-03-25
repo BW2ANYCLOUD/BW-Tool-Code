@@ -1,0 +1,51 @@
+001	BW Lineage
+002	FM Extractor
+003	Process Chains
+004	Reconciliation
+C01	Flow CSV
+C02	JSON / Mermaid Lineage
+C03	DDL Files
+C04	ASCII Tree
+C05	Mapping CSV
+C06	Routine Code
+C07	Master Data Flows
+C08	Auto-extract FMs from routines
+C09	Auto-extract Process Chains
+R01	Provider
+R02	InfoArea
+T01	BW Lineage Input
+T02	Output Options
+T05	Function Module Extractor
+T06	Process Chain Extractor
+T07	Reconciliation Engine
+T08	Auto-extract FMs from routines
+T09	Auto-extract Process Chains
+
+
+P_DDL	DDL for Bronze Silver and Gold
+P_FLOW	Flow Details
+P_FM	Entry Function Module
+P_FMDIR	FM Output Folder
+P_FM_IN	?...
+P_INF	InfoObject Name
+P_INP	Provider
+P_JSON	JSON / Mermaid Lineage
+P_MAP	Mapping CSV
+P_MAXFM	Max FM Recursion Depth
+P_MD_FL	Master Data Flows
+P_PATH	Output Root Folder
+P_PCDIR	Process Chain Output Folder
+P_PCPK	Process Chain Name
+
+P_PC_IN	?...
+P_RC_KEY	Key Field (optional)
+P_RC_OUT	Reconciliation Output Folder
+P_RC_SRC	Source Table
+P_RC_TGT	Target Table
+P_ROUT	Routine Code Files
+P_STDEP	Max Standard FM Depth
+P_TREE	ASCII Tree
+R_INFO	Info Area
+R_PROV	Info Provider
+________	______________________________
+   	                                                                                                                                    
